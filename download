@@ -1,0 +1,17 @@
+# Secrets — never commit
+.streamlit/secrets.toml
+.env
+
+# Business data — the weekly stock file and event exports must not enter git.
+# Git history is permanent; a file committed once stays recoverable forever.
+*.xlsx
+*.xls
+*.csv
+hjw_events_*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
