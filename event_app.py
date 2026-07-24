@@ -80,8 +80,13 @@ def _active_event():
 
 
 def _store_options():
-    """Store codes a venue could be, warehouse excluded, Singapore first."""
-    opts = [(c, i) for c, i in STORE_CODES.items() if c != ev.WAREHOUSE]
+    """Store codes a venue could plausibly be.
+
+    Excludes the warehouse, the block location, the repair centre and the
+    RDCs — none of those are places an event happens. Singapore first.
+    """
+    opts = [(c, i) for c, i in STORE_CODES.items()
+            if c not in ev.NON_SOURCE_LOCATIONS]
     opts.sort(key=lambda x: (x[1].get("country", "") != "SINGAPORE",
                              x[1].get("country", ""), x[0]))
     return [f"{c} — {i['name']}" for c, i in opts]
@@ -92,7 +97,12 @@ def _store_options():
 # ─────────────────────────────────────────────
 
 def render_event_sidebar(df):
-    """Event picker + create/import. Called from inside the sidebar context."""
+    """Event picker + create/import. Called from inside the sidebar context.
+
+    Calls init_state() because this runs BEFORE render_event_app() in main().
+    init_state is idempotent, so calling it from both entry points is safe.
+    """
+    init_state()
     st.markdown("**Events**")
 
     evts = st.session_state.ev_events
@@ -132,6 +142,7 @@ def render_event_sidebar(df):
             file_name=f"hjw_events_{datetime.now().strftime('%Y%m%d')}.json",
             mime="application/json",
             use_container_width=True,
+            key="ev_dl_events",
         )
 
     up = st.file_uploader("Load events file", type=["json"], key="ev_import",
@@ -304,14 +315,8 @@ def render_event_app(df):
         <div class="app-header"><h1>Event Management</h1></div>
         """, unsafe_allow_html=True)
         if not st.session_state.ev_events and not st.session_state.ev_editing:
-            st.markdown("""
-            <div class="ev-empty">
-                No events yet.<br>
-                Create one in the sidebar, paste your SKU list, and this page will tell you
-                what to send, what to pull back, and what is stuck.
-            </div>
-            """, unsafe_allow_html=True)
-            return
+            st.caption("Paste a SKU list and this page will tell you what to send, "
+                       "what to pull back, and what is stuck.")
         render_event_form(df)
         return
 
@@ -369,6 +374,7 @@ def render_event_app(df):
                 data=buf.getvalue(),
                 file_name=f"event_{event['name'].replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ev_dl_plan",
             )
 
     # ═══ RIGHT: actions ═══
