@@ -108,6 +108,46 @@ st.markdown("""
         margin-bottom: 0.35rem; font-size: 0.83rem;
         color: #888; font-style: italic;
     }
+
+    /* ── App switcher, styled as flat tabs ──
+       Renders as a segmented control, not st.tabs: st.tabs executes every
+       tab body on every rerun, which is what made the old Rebalance tab slow.
+       This dispatches instead — only the selected app runs.
+       Selectors match Streamlit's real DOM: the container is stButtonGroup and
+       each option is a button[data-variant="segmented_control"], with the
+       active one carrying [data-selected]. If a future Streamlit renames
+       these, the tabs fall back to default pill buttons — cosmetic only, the
+       switcher keeps working. */
+    div[data-testid="stButtonGroup"] {
+        border-bottom: 2px solid #e6e8ec;
+        margin-bottom: 0.5rem;
+    }
+    div[data-testid="stButtonGroup"] > div { gap: 0 !important; }
+    div[data-testid="stButtonGroup"] button[data-variant="segmented_control"] {
+        background: transparent !important;
+        border: none !important;
+        border-bottom: 2px solid transparent !important;
+        border-radius: 0 !important;
+        padding: 0.35rem 1.15rem !important;
+        margin-bottom: -2px !important;
+        color: #8a8f98 !important;
+        font-family: 'DM Sans', sans-serif !important;
+        font-size: 0.92rem !important;
+        font-weight: 500 !important;
+        transition: color 0.12s ease, border-color 0.12s ease;
+    }
+    div[data-testid="stButtonGroup"] button[data-variant="segmented_control"]:hover {
+        color: #1a1a2e !important;
+        background: transparent !important;
+    }
+    div[data-testid="stButtonGroup"] button[data-variant="segmented_control"][data-selected] {
+        color: #1a1a2e !important;
+        border-bottom: 2px solid #1a1a2e !important;
+        font-weight: 600 !important;
+        background: transparent !important;
+    }
+    /* The tab bar supplies the rule under the header, so drop the duplicate. */
+    .app-header { border-bottom: none !important; padding-bottom: 0.15rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -661,6 +701,7 @@ def render_upload():
 def render_stock_filters(df):
     """Stock Report filters. Returns the hard-filtered dataframe."""
     with st.sidebar:
+        st.divider()
         st.markdown("**Filters**")
 
         universes = sorted(df['UNIVERSE'].unique().tolist())
@@ -715,12 +756,13 @@ def main():
         """, unsafe_allow_html=True)
         return
 
-    with st.sidebar:
-        st.divider()
-        app_choice = st.radio("App", APPS, label_visibility="collapsed", key="app_choice")
-        st.divider()
+    # App switcher — top of the main area, reads as tabs. Only the selected
+    # branch executes; see the CSS note above on why this is not st.tabs.
+    app_choice = st.segmented_control(
+        "App", APPS, default=APPS[0], required=True,
+        key="app_choice", label_visibility="collapsed",
+    ) or APPS[0]
 
-    # Only the selected app renders. Each owns its own sidebar section.
     if app_choice == "Stock Report":
         filtered = render_stock_filters(df)
         render_stock_report(df, filtered)
