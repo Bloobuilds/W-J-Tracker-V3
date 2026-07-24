@@ -103,6 +103,7 @@ def render_event_sidebar(df):
     init_state is idempotent, so calling it from both entry points is safe.
     """
     init_state()
+    st.divider()
     st.markdown("**Events**")
 
     evts = st.session_state.ev_events
