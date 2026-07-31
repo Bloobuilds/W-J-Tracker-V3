@@ -55,6 +55,10 @@ EVENT_CSS = """
 </style>
 """
 
+URGENCY_DOT = {
+    "OVERDUE": "🔴", "CRITICAL": "🟠", "URGENT": "🟡", "ON TRACK": "🟢",
+}
+
 URGENCY_CLASS = {
     "ON TRACK": "ev-ontrack", "URGENT": "ev-urgent",
     "CRITICAL": "ev-critical", "OVERDUE": "ev-overdue",
@@ -87,7 +91,11 @@ def init_state():
             try:
                 st.session_state.ev_events = ev.events_from_json(json.dumps(saved))
                 if st.session_state.ev_events and not st.session_state.ev_active_id:
-                    st.session_state.ev_active_id = st.session_state.ev_events[0]["id"]
+                    # Open the soonest event, which is the one at the top of the
+                    # sidebar list — not whichever happened to be created first.
+                    soonest = sorted(st.session_state.ev_events,
+                                     key=lambda x: x.get("event_date", ""))[0]
+                    st.session_state.ev_active_id = soonest["id"]
             except Exception:
                 pass   # a corrupt file must not take the whole app down
 
@@ -157,19 +165,23 @@ def render_event_sidebar(df):
     if evts and creating:
         st.caption("Drafting a new event…")
     elif evts:
-        labels = []
-        for e in evts:
+        # Always visible, soonest first. Strict date order means an overdue
+        # event sorts to the top, which is where it should be.
+        for e in sorted(evts, key=lambda x: x.get("event_date", "")):
             days, urgency = ev.event_urgency(e)
-            labels.append(f"{e['name']} · {e['event_date']} · {urgency}")
-        ids = [e["id"] for e in evts]
-        idx = ids.index(st.session_state.ev_active_id) if st.session_state.ev_active_id in ids else 0
-        pick = st.selectbox("Open event", labels, index=idx, label_visibility="collapsed")
-        chosen = ids[labels.index(pick)]
-        if chosen != st.session_state.ev_active_id:
-            st.session_state.ev_active_id = chosen
-            st.session_state.ev_results = {}
-            st.session_state.ev_editing = False
-            st.rerun()
+            active = e["id"] == st.session_state.ev_active_id
+            try:
+                when = datetime.strptime(e["event_date"], "%Y-%m-%d").strftime("%d %b")
+            except (ValueError, KeyError):
+                when = e.get("event_date", "?")
+            label = f"{URGENCY_DOT.get(urgency, '○')}  {e['name']} · {when}"
+            if st.button(label, key=f"ev_pick_{e['id']}", use_container_width=True,
+                         type="primary" if active else "secondary"):
+                if not active:
+                    st.session_state.ev_active_id = e["id"]
+                    st.session_state.ev_results = {}
+                    st.session_state.ev_editing = False
+                    st.rerun()
     else:
         st.caption("No events yet.")
 
@@ -470,8 +482,8 @@ def render_event_app(df):
         if event["venue_type"] == "store":
             col_cfg["ROUTE"] = st.column_config.SelectboxColumn(
                 "Route", options=ev.ROUTE_CHOICES, required=True, width="small",
-                help="SR pulls the piece back to N71 first. PR ships it "
-                     "store-to-store straight to the venue.")
+                help="SR routes via N71 and generates both legs (SR + OMS) in "
+                     "one file. PR ships store-to-store straight to the venue.")
         else:
             col_cfg["ROUTE"] = None   # hidden: a block always goes via N71
 

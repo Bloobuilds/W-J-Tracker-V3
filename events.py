@@ -437,13 +437,25 @@ def plan_actions(event, lines):
                 "skus": skus,
                 "detail": f"{src} ({name}) → {dest}, direct store transfer",
             })
-        else:
+        elif is_store_venue:
+            # One file, both legs: src → N71 (SR), then N71 → venue (OMS).
+            dest = event["venue_code"]
             actions.append({
                 "kind": "SR",
-                "label": f"SR {len(skus)} SKU(s) from {src}",
-                "command": f"sr from {src} for {' '.join(skus)}",
+                "label": f"SR + OMS {len(skus)} SKU(s) {src} → {dest}",
+                "command": f"sr from {src} for {' '.join(skus)} and send to {dest}",
                 "skus": skus,
-                "detail": f"{src} ({name}) → N71, then OMS to the venue once it lands",
+                "detail": f"{src} ({name}) → N71 → {dest}, both legs in one file",
+            })
+        else:
+            # Block venue: src → N71 (SR), then N71 → N65 under the block name.
+            actions.append({
+                "kind": "SR",
+                "label": f"SR + Block {len(skus)} SKU(s) from {src}",
+                "command": (f"sr from {src} for {' '.join(skus)} "
+                            f"and block as {event['block_name']}"),
+                "skus": skus,
+                "detail": f"{src} ({name}) → N71 → {BLOCK_LOCATION}, both legs in one file",
             })
 
     return actions

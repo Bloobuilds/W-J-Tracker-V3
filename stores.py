@@ -338,7 +338,7 @@ def is_sr_request(question):
     return False
 
 
-def parse_sr_request(question, df):
+def parse_sr_request(question, df, forward_to=None, forward_block=None):
     """Parse a Store Reverse request from natural language.
 
     New format: OMS-style CSV, reversed direction.
@@ -349,6 +349,22 @@ def parse_sr_request(question, df):
     q = ' '.join(question.upper().split())  # normalize newlines/whitespace
     all_skus_in_data = set(df['SKU'].str.upper().unique())
     store_code_set = set(STORE_CODES.keys())
+
+    # ── Onward leg (optional) ──
+    # Callers may pass this explicitly (Event Management does); otherwise it is
+    # read out of the message. A plain SR has neither, so behaviour is unchanged.
+    if forward_to is None and forward_block is None:
+        forward_block = resolve_forward_block(question)
+        if not forward_block:
+            forward_to, _ = resolve_forward_target(question, df)
+    forward_to = (forward_to or "").upper() or None
+    if forward_to == "N71":
+        forward_to = None      # an SR already ends at N71
+
+    name_error = invalid_order_name(forward_block)
+    if name_error:
+        return {"success": False, "orders": [], "warnings": [],
+                "errors": [name_error], "summary": ""}
 
     # ── Find source store(s) ──
     sources = []
@@ -365,6 +381,8 @@ def parse_sr_request(question, df):
     if not sources:
         candidates = re.findall(r'\b([A-Z0-9]{2,4})\b', q)
         for c in candidates:
+            if c == forward_to:
+                continue   # that's the destination, not the source
             if c in store_code_set and c != "N71" and c not in all_skus_in_data:
                 info = STORE_CODES[c]
                 if c not in [s[0] for s in sources]:
@@ -499,11 +517,81 @@ def parse_sr_request(question, df):
                     "EXPIRATION_DATE": oms_expiration,
                 })
 
+    # Flag a forward instruction that didn't resolve, rather than silently
+    # degrading to a plain SR and leaving the planner to notice.
+    if not forward_to and not forward_block:
+        for _pattern in SR_FORWARD_MARKERS:
+            if re.search(_pattern, q):
+                warnings.append("⚠️ Couldn't work out where to send it on to — "
+                                "generated the SR to N71 only.")
+                break
+    if forward_to and any(forward_to == c for c, _ in sources):
+        warnings.append(f"⚠️ {forward_to} is both the source and the destination.")
+
+    # ── Onward leg: N71 → venue (OMS) or N71 → N65 (Block) ──
+    # One set of rows for all SKUs regardless of how many sources fed them,
+    # because every piece passes through N71 first. RELEASE_TYPE "RT" also
+    # keeps these off the store notification email.
+    forward_note = ""
+    if forward_block:
+        for sku in found_skus:
+            orders.append({
+                "ORDERNAME": forward_block,
+                "TYPE": "TS",
+                "RELEASE_TYPE": "RT",
+                "SHIP_FROM": "N71",
+                "SHIP_TO": "N65",
+                "SKU": sku,
+                "QTY": 1,
+                "STOCK_CAT": "",
+                "STORAGE_LOC": "",
+                "ALLOCATION_TYPE": "BCO",
+                "ALLOCATION_PRIORITY": "0",
+                "SPLIT_STRATEGY": "SPL",
+                "MOT": "",
+                "PRODUCT_FLAG": "",
+                "START_DATE": "",
+                "ANTICIPATION_DATE": "20290505",
+                "RELEASE_DATE": "20290505",
+                "SHIP_DATE": "",
+                "EXPIRATION_DATE": "20290630",
+            })
+        forward_note = f" → N65 (block '{forward_block}')"
+
+    elif forward_to:
+        fwd_order_name = f"SGTO{forward_to}{today_ddmmyy}"
+        for sku in found_skus:
+            orders.append({
+                "ORDERNAME": fwd_order_name,
+                "TYPE": "TS",
+                "RELEASE_TYPE": "RT",
+                "SHIP_FROM": "N71",
+                "SHIP_TO": forward_to,
+                "SKU": sku,
+                "QTY": qty,
+                "STOCK_CAT": "AVA",
+                "STORAGE_LOC": "1100",
+                "ALLOCATION_TYPE": "BCO",
+                "ALLOCATION_PRIORITY": "0",
+                "SPLIT_STRATEGY": "SPL",
+                "MOT": "",
+                "PRODUCT_FLAG": "",
+                "START_DATE": "",
+                "ANTICIPATION_DATE": "",
+                "RELEASE_DATE": "",
+                "SHIP_DATE": "",
+                "EXPIRATION_DATE": oms_expiration,
+            })
+        fwd_info = STORE_CODES.get(forward_to, {})
+        forward_note = f" → {forward_to} ({fwd_info.get('name', forward_to)})"
+
     # ── Summary ──
     source_strs = [f"{c} ({i['name']})" for c, i in sources]
     has_id = any(c in {"N63", "N64", "NB6"} for c, i in sources)
     dest_note = " (via N61 → N71)" if has_id else " → N71"
-    summary = f"✅ SR: {len(orders)} line(s) — {', '.join(found_skus)} | {', '.join(source_strs)}{dest_note}"
+    label = "SR + Block" if forward_block else ("SR + OMS" if forward_to else "SR")
+    summary = (f"✅ {label}: {len(orders)} line(s) — {', '.join(found_skus)} | "
+               f"{', '.join(source_strs)}{dest_note}{forward_note}")
 
     return {
         "success": True,
@@ -514,8 +602,101 @@ def parse_sr_request(question, df):
     }
 
 
+# ─────────────────────────────────────────────
+# SR WITH ONWARD LEG  (SR → N71 → somewhere else)
+# ─────────────────────────────────────────────
+# "Q03000 sr from NF2 and send to N74" means two movements in one file:
+#   1. NF2 → N71   (SR format, today + 4)
+#   2. N71 → N74   (OMS format, RT/1100/BCO/0, expiration 20261010)
+# This is the same shape as the existing Indonesia hub rule, so it reuses that
+# machinery rather than duplicating it — including the email rule, which drops
+# any RELEASE_TYPE=RT leg so the source store only ever sees its own action.
+
+# Ordered longest-first so "AND SEND TO" wins over a bare "SEND TO".
+SR_FORWARD_MARKERS = [
+    r'\bAND\s+THEN\s+(?:SEND|SHIP|MOVE|OMS)\s+(?:IT\s+|THEM\s+)?TO\b',
+    r'\bTHEN\s+(?:SEND|SHIP|MOVE|OMS)\s+(?:IT\s+|THEM\s+)?TO\b',
+    r'\bAND\s+(?:SEND|SHIP|MOVE|OMS)\s+(?:IT\s+|THEM\s+)?TO\b',
+    r'\b(?:SEND|SHIP|MOVE|OMS)\s+(?:IT\s+|THEM\s+)?TO\b',
+]
+
+
+def resolve_forward_target(question, df=None):
+    """Find the onward destination in an SR message.
+
+    Returns (code, info), or (None, None) when the message is a plain SR.
+    N71 is treated as no destination — an SR already ends there.
+    """
+    q = ' '.join(str(question).upper().split())
+    known_skus = set(df['SKU'].str.upper().unique()) if df is not None else set()
+
+    for pattern in SR_FORWARD_MARKERS:
+        match = re.search(pattern, q)
+        if not match:
+            continue
+        tail = q[match.end():]
+
+        # First token after the marker that is a real store and not a SKU.
+        for token in re.findall(r'\b([A-Z0-9]{2,4})\b', tail):
+            if token in known_skus:
+                continue
+            code, info = resolve_store(token)
+            if code and code != "N71":
+                return code, info
+
+        # Natural names ("... and send to Ion"), longest alias first.
+        for alias, code in sorted(STORE_ALIASES.items(), key=lambda x: -len(x[0])):
+            if alias in tail and code != "N71":
+                return code, STORE_CODES[code]
+
+    return None, None
+
+
+def invalid_order_name(name):
+    """Return an error string if `name` can't safely be a CSV ORDERNAME.
+
+    A comma splits the row into an extra column and silently produces a file
+    the warehouse system will misread, so this fails loudly instead.
+    """
+    if name is None:
+        return None
+    if "," in name:
+        return f"❌ Order name '{name}' contains a comma — that breaks the CSV. Remove it."
+    if '"' in name or "\n" in name or "\r" in name:
+        return f"❌ Order name '{name}' contains a quote or line break. Remove it."
+    return None
+
+
+def resolve_forward_block(question):
+    """Find 'block as NAME' in an SR message.
+
+    Returns the ORDERNAME exactly as typed (case preserved, matching the
+    standalone block command), or None.
+    """
+    text = ' '.join(str(question).split())
+    match = re.search(r'\bblock\s+as\s+(.+)$', text, re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        return name or None
+    return None
+
+
+def is_sr_forward_request(question, df=None):
+    """True for an SR that also carries an onward leg.
+
+    MUST be checked BEFORE is_oms_request in the routing chain: 'SEND TO' is an
+    OMS keyword, so 'sr from NF2 and send to N74' would otherwise be swallowed
+    by the OMS parser and misrouted.
+    """
+    if not is_sr_request(question):
+        return False
+    if resolve_forward_block(question):
+        return True
+    code, _ = resolve_forward_target(question, df)
+    return code is not None
+
+
 def generate_sr_csv(orders):
-    """Generate CSV string from SR orders list (OMS-style format)."""
     if not orders:
         return None
 
@@ -967,6 +1148,13 @@ def parse_block_request(question, df):
     # Extract order name: everything after "as" (case-insensitive), preserve original case
     m = re.search(r'\bas\b', original, re.IGNORECASE)
     order_name = original[m.end():].strip() if m else ""
+
+    # A comma here would add a 20th column to a 19-column row and produce a
+    # file the warehouse system silently misreads. Fail loudly instead.
+    name_error = invalid_order_name(order_name)
+    if name_error:
+        return {"success": False, "orders": [], "warnings": [],
+                "errors": [name_error], "summary": ""}
 
     # Find SKUs only in the region BEFORE "as"
     sku_region = (original[:m.start()] if m else original).upper()

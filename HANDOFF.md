@@ -195,13 +195,23 @@ Deadline rule: everything must be ready to send `READY_LEAD_DAYS` (=7) before th
 
 "Free" = STOCK_ON_HAND − PICKING − RESERVATION, floored at 0.
 
+### Sidebar
+Events are an always-visible list (not a dropdown), sorted by event date ascending, so an
+overdue event sorts to the top. Coloured dot = urgency. Active event is the primary-styled
+button. On load the soonest event opens, not the first created.
+
 ### Action planning
 `plan_actions()` groups the analysis into runnable commands, `run_action()` executes them
 through stores.py:
 - READY + store venue → `oms to {venue} for {skus}`
 - READY + block venue → `block {skus} as {block_name}`
-- ELSEWHERE → grouped by source store → `sr from {src} for {skus}` (default), or
-  `pr {venue} from {src} for {skus}` when the user picks the direct store-to-store route.
+- ELSEWHERE, route SR (default) → BOTH legs in one file:
+  store venue → `sr from {src} for {skus} and send to {venue}`
+  block venue → `sr from {src} for {skus} and block as {block_name}`
+- ELSEWHERE, route PR → `pr {venue} from {src} for {skus}` (direct store-to-store)
+The Route column offers SR/PR for store venues only. For a block venue it stays hidden and
+everything routes via N71, because a block is by definition an N71→N65 movement — there is no
+"direct to block" process. Revisit if that turns out to be wrong.
 Source ranking: Singapore first, then most free units. `NON_SOURCE_LOCATIONS` excludes the
 warehouse, block location, repair centre and RDCs. Ecom/CS locations are still selectable —
 no policy decision has been made on those.
@@ -238,6 +248,22 @@ SR auto-generates a notification email per source store (blue bubble, Copy butto
 to store_{code}@louisvuitton.com, cc from STORE_CONTACTS, subject "{Universe} SR ({code})",
 HTML table (blue #4472C4 header): SKU | SKU DESCRIPTION | QTY | FROM | TO | DUE DATE.
 Email EXCLUDES the Indonesia N61→N71 leg (stores only see their own action).
+
+**SR + ONWARD LEG** (added 31 Jul 2026). One file, two movements.
+Cmd: `Q03039 sr from NF2 and send to N74` → SR leg NF2→N71, then OMS leg N71→N74
+(ORDERNAME `SGTO{dest}{DDMMYY}`, RT/1100/BCO/0, expiration 20261010).
+Cmd: `Q03039 sr from NF2 and block as PHcarnet` → SR leg, then the block row N71→N65.
+Also callable directly: `parse_sr_request(q, df, forward_to="N74")` or `forward_block="PHcarnet"`
+— Event Management uses that path. Markers recognised: SEND/SHIP/MOVE/OMS TO, optionally
+prefixed AND/THEN. Destination resolves by code or alias. "send to N71" is treated as no
+onward leg, since an SR already ends there.
+Indonesia sources stack correctly: N63 + forward = 3 legs (N63→N61, N61→N71, N71→dest).
+Email still goes to the source store only — the exclusion filter drops any RELEASE_TYPE=RT
+leg, which covers both the hub leg and the new onward leg.
+**ROUTING**: `is_sr_forward_request()` MUST be checked before OMS — "SEND TO" is an OMS
+keyword, so app.py's check 1 reads `is_oms_request(pq) and not is_sr_forward_request(pq, df)`.
+Without that exclusion the combined command is swallowed by the OMS parser.
+Known edge: "sr ... send to N71" (redundant phrasing) still routes to OMS.
 
 **PR** (store → store). Cmd: `pr NC3 from NF2 for Q1TC10`
 Row: {src}TO{dest}{DDMONYY} (e.g. NF2TONC302JUNE26),TS,,{src},{dest},{sku},{qty},AVA,,,,SPL,,,,,,,{today+5}
@@ -285,6 +311,12 @@ Detection needs both "block" AND "as" (so "what is block location" still goes to
   draft); the venue dropdown offered N65/N7X/SG11/RDCs as venues and defaulted to N65, the
   block location; `select_dtypes(include="object")` in the table search would silently match
   nothing once pandas removes the str-under-object fallback.
+- 31 Jul 2026: SR with an onward leg (SR+OMS / SR+Block in one file); Event Management's SR
+  route now generates both legs instead of leaving the OMS to be done by hand. Event dropdown
+  replaced by a date-sorted always-visible list. Fixed: a comma in a block ORDERNAME produced a
+  20-column row against a 19-column header — silently malformed CSV, in BOTH the new combined
+  command and the pre-existing standalone `block` command; now rejected with a clear error.
+  Added warnings for an unresolved onward destination and for source == destination.
 - User prefers: talk/plan first before building; concise chat replies; instant Python over AI
   wherever deterministic.
 

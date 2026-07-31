@@ -12,7 +12,8 @@ import io
 import re
 from datetime import datetime
 from stores import (STORE_CODES, is_oms_request, parse_oms_request, generate_oms_csv,
-                    is_sr_request, parse_sr_request, generate_sr_csv, generate_sr_email,
+                    is_sr_request, is_sr_forward_request, parse_sr_request,
+                    generate_sr_csv, generate_sr_email,
                     is_pr_request, parse_pr_request, generate_pr_csv, generate_pr_email,
                     is_block_request, parse_block_request, generate_block_csv)
 from event_app import render_event_app, render_event_sidebar
@@ -1144,7 +1145,10 @@ function copyEmail() {{
                 st.session_state.pending_question = None
 
                 # Check 1: OMS request?
-                if is_oms_request(pq):
+                # An SR carrying an onward leg ("sr from NF2 and send to N74")
+                # contains "SEND TO", which is an OMS keyword — so it must be
+                # excluded here or it never reaches the SR branch below.
+                if is_oms_request(pq) and not is_sr_forward_request(pq, df):
                     result = parse_oms_request(pq, df)
                     if result["success"]:
                         st.session_state.oms_csv = generate_oms_csv(result["orders"])
@@ -1164,7 +1168,8 @@ function copyEmail() {{
                             st.session_state.chat_history.append({"role": "error", "content": err})
                     st.rerun()
 
-                # Check 2: SR (Store Reverse)?
+                # Check 2: SR (Store Reverse), optionally with an onward
+                # OMS/Block leg — parse_sr_request detects that from the message.
                 elif is_sr_request(pq):
                     result = parse_sr_request(pq, df)
                     if result.get("needs_counter"):
