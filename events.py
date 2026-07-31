@@ -129,6 +129,8 @@ def new_event(name, event_date, venue_type, venue_code="", block_name="", skus=N
         "venue_code": (venue_code or "").upper().strip(),
         "block_name": (block_name or "").strip(),
         "skus": list(skus or []),
+        "notes_by_sku": {},      # sku -> planner's own note
+        "route_by_sku": {},      # sku -> "SR" or "PR" override for recovery
         "created": datetime.now().isoformat(timespec="seconds"),
         "notes": "",
     }
@@ -228,6 +230,8 @@ def analyse_event(event, df):
                 "frp": 0.0, "status": STATUS_MISSING, "free_at_n71": 0,
                 "transit_to_n71": 0, "at_venue": 0, "sources": [],
                 "note": "Not in this week's file at all.",
+                "user_note": event.get("notes_by_sku", {}).get(sku, ""),
+                "route": event.get("route_by_sku", {}).get(sku, "SR"),
             })
             continue
 
@@ -301,6 +305,8 @@ def analyse_event(event, df):
             "segment": segment, "frp": frp, "status": status,
             "free_at_n71": free_n71, "transit_to_n71": transit_n71,
             "at_venue": at_venue, "sources": sources, "note": note,
+            "user_note": event.get("notes_by_sku", {}).get(sku, ""),
+            "route": event.get("route_by_sku", {}).get(sku, "SR"),
         })
 
     lines.sort(key=lambda l: (STATUS_ORDER.index(l["status"]), -l["frp"]))
@@ -374,21 +380,23 @@ def build_brief(event, lines, today=None):
 # Every action is expressed as a command string for stores.py. Nothing here
 # builds a CSV row — that stays in one place.
 
-def plan_actions(event, lines, route="SR"):
+def plan_actions(event, lines):
     """Turn the analysis into concrete, runnable commands.
 
-    route: for ELSEWHERE lines — 'SR' pulls to N71 first (the documented
-           process), 'PR' sends store-to-store directly (faster, only valid
-           when the venue is a store).
+    Recovery route is per SKU (`event["route_by_sku"]`, default "SR"):
+      SR — pull to N71 first, the documented process
+      PR — ship store-to-store directly, faster, only valid for a store venue
+    Lines are grouped by (source store, route), so one event can do both.
 
     Returns a list of dicts: {kind, label, command, skus, detail}
     """
     actions = []
+    is_store_venue = event.get("venue_type") == "store"
 
     # ── Send what is ready ──
     ready = [l["sku"] for l in lines if l["status"] == STATUS_READY]
     if ready:
-        if event.get("venue_type") == "block":
+        if not is_store_venue:
             actions.append({
                 "kind": "BLOCK",
                 "label": f"Block {len(ready)} SKU(s) → N65 as '{event['block_name']}'",
@@ -406,17 +414,21 @@ def plan_actions(event, lines, route="SR"):
                 "detail": f"N71 → {dest}",
             })
 
-    # ── Recover what is elsewhere, grouped by source store ──
-    elsewhere = [l for l in lines if l["status"] == STATUS_ELSEWHERE and l["sources"]]
-    by_source = {}
-    for l in elsewhere:
+    # ── Recover what is elsewhere, grouped by (source store, route) ──
+    grouped = {}
+    for l in lines:
+        if l["status"] != STATUS_ELSEWHERE or not l["sources"]:
+            continue
         src = l["sources"][0]["code"]
-        by_source.setdefault(src, []).append(l["sku"])
+        # PR is only meaningful when there is a store to ship to.
+        route = l.get("route", "SR")
+        if route == "PR" and not is_store_venue:
+            route = "SR"
+        grouped.setdefault((src, route), []).append(l["sku"])
 
-    for src, skus in sorted(by_source.items()):
-        info = STORE_CODES.get(src, {})
-        name = info.get("name", src)
-        if route == "PR" and event.get("venue_type") == "store":
+    for (src, route), skus in sorted(grouped.items()):
+        name = STORE_CODES.get(src, {}).get("name", src)
+        if route == "PR":
             dest = event["venue_code"]
             actions.append({
                 "kind": "PR",
@@ -506,14 +518,25 @@ def events_from_json(text):
         e.setdefault("venue_code", "")
         e.setdefault("block_name", "")
         e.setdefault("notes", "")
+        e.setdefault("notes_by_sku", {})
+        e.setdefault("route_by_sku", {})
         out.append(e)
     return out
 
 
+ROUTE_CHOICES = ["SR", "PR"]
+
+
 def lines_to_dataframe(lines):
-    """Flatten the analysis for display / export."""
+    """Flatten the analysis for the editable plan table.
+
+    Column order matters: the two editable columns (ROUTE, NOTES) sit at the
+    right so the read-only status columns stay stable while typing.
+    """
     if not lines:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["STATUS", "SKU", "DESCRIPTION", "SEGMENT",
+                                     "FRP", "FREE_N71", "TRANSIT_N71",
+                                     "BEST_SOURCE", "DETAIL", "ROUTE", "NOTES"])
     return pd.DataFrame([{
         "STATUS": f"{STATUS_EMOJI.get(l['status'], '')} {l['status']}",
         "SKU": l["sku"],
@@ -523,5 +546,116 @@ def lines_to_dataframe(lines):
         "FREE_N71": l["free_at_n71"],
         "TRANSIT_N71": l["transit_to_n71"],
         "BEST_SOURCE": l["sources"][0]["code"] if l["sources"] else "",
-        "NOTE": l["note"],
+        "DETAIL": l["note"],
+        "ROUTE": l.get("route", "SR"),
+        "NOTES": l.get("user_note", ""),
     } for l in lines])
+
+
+# ─────────────────────────────────────────────
+# MUTATIONS
+# ─────────────────────────────────────────────
+# The plan table is editable. These apply the edits back onto the event dict,
+# which is what gets serialised into the events file — so notes, route choices
+# and removals all survive a save/load round trip.
+
+def remove_skus(event, skus):
+    """Drop SKUs from the event, along with their notes and route overrides."""
+    drop = {s.upper() for s in skus}
+    event["skus"] = [s for s in event["skus"] if s not in drop]
+    for s in drop:
+        event.get("notes_by_sku", {}).pop(s, None)
+        event.get("route_by_sku", {}).pop(s, None)
+    return event
+
+
+def add_skus(event, skus, df):
+    """Append SKUs to the event. Returns (added, rejected)."""
+    known = set(df['SKU'].astype(str).str.upper().unique())
+    added, rejected = [], []
+    for s in skus:
+        s = str(s).strip().upper()
+        if not s or s in event["skus"]:
+            continue
+        if s in known:
+            event["skus"].append(s)
+            added.append(s)
+        else:
+            rejected.append(s)
+    return added, rejected
+
+
+def set_note(event, sku, note):
+    event.setdefault("notes_by_sku", {})
+    note = (note or "").strip()
+    if note:
+        event["notes_by_sku"][sku.upper()] = note
+    else:
+        event["notes_by_sku"].pop(sku.upper(), None)
+    return event
+
+
+def set_route(event, sku, route):
+    event.setdefault("route_by_sku", {})
+    route = (route or "SR").upper()
+    if route not in ROUTE_CHOICES:
+        route = "SR"
+    if route == "SR":
+        event["route_by_sku"].pop(sku.upper(), None)   # SR is the default
+    else:
+        event["route_by_sku"][sku.upper()] = route
+    return event
+
+
+def apply_table_edits(event, editor_state, display_skus, df):
+    """Apply st.data_editor changes onto the event.
+
+    editor_state is the dict Streamlit puts in session_state for a keyed
+    data_editor: {"edited_rows": {row: {col: val}}, "deleted_rows": [row],
+    "added_rows": [{col: val}]}. Row numbers are positions in the frame that
+    was handed to the editor, so `display_skus` maps them back to SKUs.
+
+    Returns (changed: bool, messages: list[str]).
+    """
+    if not editor_state:
+        return False, []
+
+    changed, messages = False, []
+
+    # ── Deletions ──
+    deleted = editor_state.get("deleted_rows") or []
+    drop = [display_skus[i] for i in deleted if 0 <= i < len(display_skus)]
+    if drop:
+        remove_skus(event, drop)
+        changed = True
+        messages.append(f"Removed {', '.join(drop)}.")
+
+    # ── Cell edits ──
+    for row, edits in (editor_state.get("edited_rows") or {}).items():
+        try:
+            idx = int(row)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(display_skus)):
+            continue
+        sku = display_skus[idx]
+        if sku in drop:
+            continue
+        if "NOTES" in edits:
+            set_note(event, sku, edits["NOTES"])
+            changed = True
+        if "ROUTE" in edits:
+            set_route(event, sku, edits["ROUTE"])
+            changed = True
+
+    # ── Added rows ──
+    new_skus = [r.get("SKU") for r in (editor_state.get("added_rows") or []) if r.get("SKU")]
+    if new_skus:
+        added, rejected = add_skus(event, new_skus, df)
+        if added:
+            changed = True
+            messages.append(f"Added {', '.join(added)}.")
+        if rejected:
+            messages.append(f"Not in this file, ignored: {', '.join(rejected)}.")
+
+    return changed, messages
