@@ -171,10 +171,13 @@ def render_event_sidebar(df):
             days, urgency = ev.event_urgency(e)
             active = e["id"] == st.session_state.ev_active_id
             when = ev.date_range_label(e)
-            # Flag of the venue country. The urgency word is appended only
-            # when it is not ON TRACK, so the list stays quiet until it matters.
+            # No country flag: flag emoji are regional-indicator letter pairs,
+            # and Windows renders them as the bare two-letter code ("SG"), so
+            # they read as noise rather than as flags. The urgency word is
+            # appended only when it is not ON TRACK, keeping the list quiet
+            # until something needs attention.
             tail = "" if urgency == "ON TRACK" else f" · {urgency}"
-            label = f"{ev.event_flag(e)}  {e['name']} · {when}{tail}"
+            label = f"{e['name']} · {when}{tail}"
             if st.button(label, key=f"ev_pick_{e['id']}", use_container_width=True,
                          type="primary" if active else "secondary"):
                 if not active:
@@ -450,7 +453,7 @@ def render_event_app(df):
 
     st.markdown(f"""
     <div class="app-header">
-        <h1>{ev.event_flag(event)} {event['name']}</h1>
+        <h1>{event['name']}</h1>
         <span class="stats">
             {venue_label} &nbsp;|&nbsp; {ev.date_range_label(event)} {event['event_date'][:4]}
             &nbsp;|&nbsp; Ready by {ev.ready_by_date(event).strftime('%d %b %Y')}

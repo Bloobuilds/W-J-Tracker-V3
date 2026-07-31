@@ -201,11 +201,17 @@ Deadline rule: everything must be ready to send `READY_LEAD_DAYS` (=7) before th
 
 ### Sidebar
 Events are an always-visible list (not a dropdown), sorted by start date ascending, so an
-overdue event sorts to the top. Each row shows the **venue country's flag**
-(`COUNTRY_FLAGS` in stores.py, keyed to the country values already in STORE_CODES; blocks show
-🇸🇬 since N65 is Singapore), the name and the date range. The urgency word is appended only
-when it is NOT "ON TRACK", so the list stays quiet until something needs attention. Active
-event is the primary-styled button. On load the soonest event opens, not the first created.
+overdue event sorts to the top. Each row shows the name and the date range. The urgency word is
+appended only when it is NOT "ON TRACK", so the list stays quiet until something needs
+attention. Active event is the primary-styled button. On load the soonest event opens, not the
+first created.
+
+**No country flags in the UI.** They were tried and removed: flag emoji are pairs of
+regional-indicator letters, and Windows renders them as the bare two-letter code — 🇸🇬 shows as
+"SG" — so they read as noise. `COUNTRY_FLAGS` / `country_flag` / `store_flag` (stores.py) and
+`event_flag` (events.py) are kept but unused; re-enabling is one line if the app is ever used
+on macOS/iOS/Android, which render them properly. Do not re-add without checking the target
+platform.
 
 ### Action planning
 `plan_actions()` groups the analysis into runnable commands, `run_action()` executes them
@@ -332,6 +338,8 @@ Detection needs both "block" AND "as" (so "what is block location" still goes to
   country flags with the urgency word shown only when not ON TRACK; action buttons and
   filenames now name the actual document ("Generate SR + OMS"); event name threaded into SR/PR
   notification emails; email sign-off changed to "Thank you for your support!".
+- Country flags in the event list: added then removed same day — they render as "SG"/"ID" text
+  on Windows. Helpers kept, UI usage removed. Don't re-litigate without a non-Windows client.
 - User prefers: talk/plan first before building; concise chat replies; instant Python over AI
   wherever deterministic.
 

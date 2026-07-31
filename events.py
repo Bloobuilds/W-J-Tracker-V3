@@ -199,7 +199,13 @@ def date_range_label(event):
 
 
 def event_flag(event):
-    """Flag of the venue's country. Blocks sit at N65, which is Singapore."""
+    """Flag of the venue's country. Blocks sit at N65, which is Singapore.
+
+    NOT used in the UI: Windows renders flag emoji as their bare two-letter
+    code ("SG" rather than a Singapore flag), so they read as noise. Kept
+    because it is one line to re-enable if the app is ever used somewhere that
+    renders them properly (macOS, iOS, Android).
+    """
     if event.get("venue_type") == "store" and event.get("venue_code"):
         return store_flag(event["venue_code"])
     return store_flag(BLOCK_LOCATION)
