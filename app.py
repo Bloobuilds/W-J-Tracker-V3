@@ -16,6 +16,11 @@ from stores import (STORE_CODES, is_oms_request, parse_oms_request, generate_oms
                     is_pr_request, parse_pr_request, generate_pr_csv, generate_pr_email,
                     is_block_request, parse_block_request, generate_block_csv)
 from event_app import render_event_app, render_event_sidebar
+import storage
+from auth import require_auth
+
+# Namespace under which the weekly stock file is cached on the volume.
+STOCK_STORE = "stock_current"
 
 # Apps available in the switcher. Only the selected one renders — Streamlit
 # executes every branch it is given, so this must stay a dispatch, not tabs.
@@ -667,10 +672,29 @@ def detect_skus_in_question(question, df):
 # SIDEBAR
 # ─────────────────────────────────────────────
 
+def restore_stock():
+    """Reload the cached weekly file after a refresh or a redeploy.
+
+    Runs once per session. Reads the parquet the last upload wrote, so the
+    planner isn't re-uploading the same Excel every time the page reloads.
+    """
+    if st.session_state.get("stock_restored"):
+        return
+    st.session_state.stock_restored = True
+    if st.session_state.df is not None:
+        return
+    cached = storage.load_dataframe(STOCK_STORE)
+    if cached is not None and len(cached):
+        st.session_state.df = cached
+        meta = storage.dataframe_meta(STOCK_STORE) or {}
+        st.session_state.upload_sig = meta.get("sig")
+        st.session_state.stock_meta = meta
+
+
 def render_upload():
     """Shared across every app: the weekly file. Called inside the sidebar.
 
-    Re-uploading a different file now replaces the loaded data. Previously this
+    Re-uploading a different file replaces the loaded data. Previously this
     only ran when nothing was loaded, so the second upload of a session was
     silently ignored until the browser was refreshed.
     """
@@ -678,10 +702,11 @@ def render_upload():
     uploaded = st.file_uploader("Upload tracker", type=["xlsx", "xls", "csv"],
                                 label_visibility="collapsed", key="tracker_upload")
     if uploaded:
-        sig = (uploaded.name, uploaded.size)
+        sig = f"{uploaded.name}:{uploaded.size}"
         if sig != st.session_state.get("upload_sig"):
             with st.spinner("Loading..."):
-                st.session_state.df = load_and_process(uploaded)
+                df = load_and_process(uploaded)
+                st.session_state.df = df
                 st.session_state.upload_sig = sig
                 st.session_state.chat_history = []
                 st.session_state.ai_filter_df = None
@@ -691,11 +716,19 @@ def render_upload():
                 st.session_state.pr_csv = None
                 st.session_state.block_csv = None
                 st.session_state.ev_results = {}   # event plans re-run on new data
+                # Cache it so a refresh doesn't mean re-uploading.
+                storage.save_dataframe(STOCK_STORE, df,
+                                       meta={"filename": uploaded.name, "sig": sig})
+                st.session_state.stock_meta = storage.dataframe_meta(STOCK_STORE)
             st.rerun()
 
     df = st.session_state.df
     if df is not None:
         st.caption(f"{len(df):,} rows | {df['SKU'].nunique():,} SKUs")
+        meta = st.session_state.get("stock_meta") or {}
+        if meta.get("filename"):
+            saved = (meta.get("saved_at") or "")[:16].replace("T", " ")
+            st.caption(f"{meta['filename']} · uploaded {saved}")
 
 
 def render_stock_filters(df):
@@ -733,14 +766,21 @@ def render_stock_filters(df):
 # ─────────────────────────────────────────────
 
 def main():
+    # Auth first: nothing below this line renders until the password is
+    # accepted — no sidebar, no uploader, no cached data.
+    require_auth()
+
     for key, default in [
         ("df", None), ("chat_history", []),
         ("ai_filter_df", None), ("ai_filter_desc", None),
         ("show_extra_cols", False), ("oms_csv", None), ("sr_csv", None), ("pr_csv", None), ("block_csv", None),
         ("pending_question", None), ("upload_sig", None),
+        ("stock_restored", False), ("stock_meta", None),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
+
+    restore_stock()
 
     with st.sidebar:
         render_upload()
@@ -770,6 +810,56 @@ def main():
         with st.sidebar:
             render_event_sidebar(df)
         render_event_app(df)
+
+    render_storage_footer()
+
+
+def render_storage_footer():
+    """Storage state at the bottom of the sidebar.
+
+    The warning matters: if DATA_DIR isn't a mounted volume we're writing to
+    container-local disk, which Railway wipes on the next deploy. Better to say
+    so than to let the planner trust storage that isn't durable.
+    """
+    with st.sidebar:
+        st.divider()
+        status = storage.storage_status()
+        kb = storage.usage() / 1024
+        size = f"{kb/1024:.1f} MB" if kb > 1024 else f"{kb:.0f} KB"
+        if status["persistent"]:
+            st.caption(f"Saved to volume · {size}")
+        else:
+            st.warning(
+                "Not on a volume — saved data will be lost on the next deploy. "
+                f"Mount a Railway volume and set DATA_DIR to its path "
+                f"(currently {status['dir']}).",
+                icon="⚠️",
+            )
+
+        # Two-step so a stray click can't wipe the stock file and every event.
+        with st.expander("Stored data"):
+            st.caption("Clearing removes the cached stock file and all saved "
+                       "events. Download your events file first if you want a "
+                       "backup.")
+            if st.session_state.get("confirm_wipe"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Confirm", type="primary", use_container_width=True,
+                                 key="wipe_yes"):
+                        storage.wipe_all()
+                        for k in ["df", "stock_meta", "upload_sig", "ev_events",
+                                  "ev_active_id", "ev_results", "confirm_wipe"]:
+                            st.session_state.pop(k, None)
+                        st.rerun()
+                with c2:
+                    if st.button("Cancel", use_container_width=True, key="wipe_no"):
+                        st.session_state.confirm_wipe = False
+                        st.rerun()
+            else:
+                if st.button("Clear stored data", use_container_width=True,
+                             key="wipe_start"):
+                    st.session_state.confirm_wipe = True
+                    st.rerun()
 
 
 def render_stock_report(df, filtered):
@@ -851,7 +941,12 @@ def render_stock_report(df, filtered):
 
         if search:
             term = search.upper().strip()
-            text_cols = table_data.select_dtypes(include='object').columns
+            # pandas 3 moved string columns from 'object' to 'str' dtype and
+            # only still matches them under 'object' for backward compatibility,
+            # which it warns will be removed. Naming both keeps search working
+            # on pandas 2 and 3+ alike — otherwise it would one day silently
+            # find nothing rather than erroring.
+            text_cols = table_data.select_dtypes(include=['object', 'str']).columns
             smask = table_data[text_cols].apply(
                 lambda c: c.astype(str).str.upper().str.contains(term, na=False)
             ).any(axis=1)

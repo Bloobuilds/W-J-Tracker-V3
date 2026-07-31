@@ -11,6 +11,7 @@ planner happens to be looking at.
 """
 
 import io
+import json
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -18,7 +19,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import events as ev
+import storage
 from stores import STORE_CODES
+
+# Namespace under which the event list is persisted.
+EVENTS_STORE = "events"
 
 EVENT_CSS = """
 <style>
@@ -64,12 +69,37 @@ def init_state():
     for key, default in [
         ("ev_events", []),          # list of event dicts
         ("ev_active_id", None),     # currently open event
-        ("ev_route", "SR"),         # SR (via N71) or PR (direct store-to-store)
         ("ev_results", {}),         # action label -> run_action() result
         ("ev_editing", False),      # show the edit form
+        ("ev_plan_skus", []),       # display order, maps editor rows -> SKUs
+        ("ev_edit_msgs", []),       # feedback from the last table edit
+        ("ev_loaded", False),       # saved events restored this session
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
+
+    # Restore the saved event list once per session. Without this the planner
+    # loses every event on refresh and on each redeploy.
+    if not st.session_state.get("ev_loaded"):
+        st.session_state.ev_loaded = True
+        saved = storage.load_json(EVENTS_STORE, None)
+        if saved:
+            try:
+                st.session_state.ev_events = ev.events_from_json(json.dumps(saved))
+                if st.session_state.ev_events and not st.session_state.ev_active_id:
+                    st.session_state.ev_active_id = st.session_state.ev_events[0]["id"]
+            except Exception:
+                pass   # a corrupt file must not take the whole app down
+
+
+def persist_events():
+    """Write the event list to durable storage.
+
+    Called after every mutation — create, edit, delete, import, and inline
+    table edits. Only on actual change: Streamlit reruns on every click, and a
+    disk write per keystroke would be wasteful.
+    """
+    return storage.save_json(EVENTS_STORE, st.session_state.ev_events)
 
 
 def _active_event():
@@ -77,6 +107,18 @@ def _active_event():
         if e["id"] == st.session_state.ev_active_id:
             return e
     return None
+
+
+def _clear_form_state(event_id=None):
+    """Drop the form's widget state.
+
+    Form widgets are keyed so they don't bleed between events, but a keyed
+    widget reads session_state in preference to its `value=` argument. Without
+    this, opening New right after saving would redisplay the saved event.
+    """
+    prefix = f"evf_{event_id or 'new'}_"
+    for k in [k for k in st.session_state.keys() if str(k).startswith(prefix)]:
+        del st.session_state[k]
 
 
 def _store_options():
@@ -107,7 +149,14 @@ def render_event_sidebar(df):
     st.markdown("**Events**")
 
     evts = st.session_state.ev_events
-    if evts:
+    # While a new event is being drafted there is no active event, and the
+    # picker must not "helpfully" select the first one — doing so reassigns
+    # ev_active_id and cancels the draft before the form is ever shown.
+    creating = st.session_state.ev_editing and st.session_state.ev_active_id is None
+
+    if evts and creating:
+        st.caption("Drafting a new event…")
+    elif evts:
         labels = []
         for e in evts:
             days, urgency = ev.event_urgency(e)
@@ -127,12 +176,14 @@ def render_event_sidebar(df):
     c1, c2 = st.columns(2)
     with c1:
         if st.button("New", use_container_width=True):
+            _clear_form_state(None)
             st.session_state.ev_active_id = None
             st.session_state.ev_editing = True
             st.session_state.ev_results = {}
             st.rerun()
     with c2:
         if evts and st.button("Edit", use_container_width=True):
+            _clear_form_state(st.session_state.ev_active_id)
             st.session_state.ev_editing = True
             st.rerun()
 
@@ -156,6 +207,7 @@ def render_event_sidebar(df):
             if added:
                 st.session_state.ev_events.extend(added)
                 st.session_state.ev_active_id = added[0]["id"]
+                persist_events()
                 st.rerun()
         except Exception as exc:
             st.error(f"Could not read that file: {exc}")
@@ -172,12 +224,17 @@ def render_event_form(df):
 
     st.markdown("#### " + ("New event" if is_new else f"Edit — {event['name']}"))
 
+    # Widget keys are scoped to the event being edited. Without this, opening
+    # "New" straight after editing an event can inherit the previous values,
+    # because unkeyed widgets are identified by position.
+    k = f"evf_{event['id'] if event else 'new'}"
+
     name = st.text_input("Event name", value="" if is_new else event["name"],
-                         placeholder="e.g. Manila Private Salon")
+                         placeholder="e.g. Manila Private Salon", key=f"{k}_name")
 
     default_date = (date.today() + timedelta(days=21) if is_new
                     else datetime.strptime(event["event_date"], "%Y-%m-%d").date())
-    event_date = st.date_input("Event date", value=default_date)
+    event_date = st.date_input("Event date", value=default_date, key=f"{k}_date")
     st.caption(f"Everything must be ready to send by "
                f"**{(event_date - timedelta(days=ev.READY_LEAD_DAYS)).strftime('%d %b %Y')}** "
                f"({ev.READY_LEAD_DAYS} days before).")
@@ -186,7 +243,7 @@ def render_event_form(df):
         "Venue", ["store", "block"],
         index=0 if is_new or event["venue_type"] == "store" else 1,
         format_func=lambda v: "Store code" if v == "store" else "Block (N71 → N65)",
-        horizontal=True,
+        horizontal=True, key=f"{k}_venuetype",
     )
 
     venue_code, block_name = "", ""
@@ -198,15 +255,16 @@ def render_event_form(df):
                 if o.startswith(event["venue_code"]):
                     default_idx = i
                     break
-        venue_code = st.selectbox("Venue store", opts, index=default_idx).split(" — ")[0]
+        venue_code = st.selectbox("Venue store", opts, index=default_idx,
+                                  key=f"{k}_venue").split(" — ")[0]
     else:
         block_name = st.text_input(
             "Block order name", value="" if is_new else event.get("block_name", ""),
-            placeholder="e.g. PHcarnet",
+            placeholder="e.g. PHcarnet", key=f"{k}_block",
             help="Used verbatim as ORDERNAME in the block CSV. Case is preserved.")
 
     existing_skus = "" if is_new else "\n".join(event["skus"])
-    sku_text = st.text_area("SKUs", value=existing_skus, height=160,
+    sku_text = st.text_area("SKUs", value=existing_skus, height=160, key=f"{k}_skus",
                             placeholder="Paste your SKU list — one per line, or comma separated.")
 
     known, unknown = ev.parse_sku_list(sku_text, df)
@@ -234,11 +292,20 @@ def render_event_form(df):
                 else:
                     draft["id"] = event["id"]
                     draft["created"] = event.get("created", draft["created"])
+                    # Carry over per-SKU notes and route choices, keeping only
+                    # the ones whose SKU survived the edit. Without this, a
+                    # rename or a SKU-list tweak would silently wipe them.
+                    kept = set(draft["skus"])
+                    draft["notes_by_sku"] = {s: n for s, n in
+                                             event.get("notes_by_sku", {}).items() if s in kept}
+                    draft["route_by_sku"] = {s: r for s, r in
+                                             event.get("route_by_sku", {}).items() if s in kept}
                     for i, e in enumerate(st.session_state.ev_events):
                         if e["id"] == event["id"]:
                             st.session_state.ev_events[i] = draft
                 st.session_state.ev_editing = False
                 st.session_state.ev_results = {}
+                persist_events()
                 st.rerun()
     with c2:
         if st.button("Cancel", use_container_width=True):
@@ -252,7 +319,31 @@ def render_event_form(df):
             st.session_state.ev_active_id = (
                 st.session_state.ev_events[0]["id"] if st.session_state.ev_events else None)
             st.session_state.ev_editing = False
+            persist_events()
             st.rerun()
+
+
+def _on_plan_edit():
+    """Write plan-table edits back onto the active event.
+
+    Runs as a widget callback, so it fires BEFORE the script re-executes —
+    meaning the brief, the table and the actions panel all rebuild from the
+    edited event in the same pass, with no stale intermediate render.
+    """
+    event = _active_event()
+    if event is None:
+        return
+    changed, msgs = ev.apply_table_edits(
+        event,
+        st.session_state.get("ev_plan_editor"),
+        st.session_state.get("ev_plan_skus", []),
+        st.session_state.get("df"),
+    )
+    st.session_state.ev_edit_msgs = msgs
+    if changed:
+        # The plan moved, so anything already generated is out of date.
+        st.session_state.ev_results = {}
+        persist_events()
 
 
 # ─────────────────────────────────────────────
@@ -357,17 +448,47 @@ def render_event_app(df):
         """, unsafe_allow_html=True)
 
         table = ev.lines_to_dataframe(lines)
+        st.session_state.ev_plan_skus = [l["sku"] for l in lines]
+
+        st.caption("Edit ROUTE and NOTES inline. Select a row and press the bin "
+                   "to remove it, or use the last row to add a SKU. Changes save "
+                   "into the event.")
+
+        col_cfg = {
+            "STATUS": st.column_config.TextColumn("Status", disabled=True, width="small"),
+            "SKU": st.column_config.TextColumn("SKU", width="small"),
+            "DESCRIPTION": st.column_config.TextColumn("Description", disabled=True),
+            "SEGMENT": st.column_config.TextColumn("Segment", disabled=True, width="small"),
+            "FRP": st.column_config.NumberColumn("FRP", format="$%d", disabled=True),
+            "FREE_N71": st.column_config.NumberColumn("Free N71", format="%d", disabled=True),
+            "TRANSIT_N71": st.column_config.NumberColumn("Transit", format="%d", disabled=True),
+            "BEST_SOURCE": st.column_config.TextColumn("Source", disabled=True, width="small"),
+            "DETAIL": st.column_config.TextColumn("Detail", disabled=True),
+            "NOTES": st.column_config.TextColumn("Notes", width="medium"),
+        }
+        # PR only makes sense when there is a destination store to ship to.
+        if event["venue_type"] == "store":
+            col_cfg["ROUTE"] = st.column_config.SelectboxColumn(
+                "Route", options=ev.ROUTE_CHOICES, required=True, width="small",
+                help="SR pulls the piece back to N71 first. PR ships it "
+                     "store-to-store straight to the venue.")
+        else:
+            col_cfg["ROUTE"] = None   # hidden: a block always goes via N71
+
+        st.data_editor(
+            table,
+            use_container_width=True, hide_index=True, height=430,
+            num_rows="dynamic",
+            column_config=col_cfg,
+            key="ev_plan_editor",
+            on_change=_on_plan_edit,
+        )
+
+        for msg in st.session_state.ev_edit_msgs:
+            st.caption(msg)
+        st.session_state.ev_edit_msgs = []
+
         if len(table):
-            st.dataframe(
-                table,
-                use_container_width=True, hide_index=True, height=430,
-                column_config={
-                    "FRP": st.column_config.NumberColumn("FRP", format="$%d"),
-                    "FREE_N71": st.column_config.NumberColumn("Free N71", format="%d"),
-                    "TRANSIT_N71": st.column_config.NumberColumn("Transit", format="%d"),
-                },
-                key="ev_table",
-            )
             buf = io.BytesIO()
             table.to_excel(buf, index=False, engine="openpyxl")
             st.download_button(
@@ -382,22 +503,7 @@ def render_event_app(df):
     with col_right:
         st.markdown("**Actions**")
 
-        if event["venue_type"] == "store":
-            route = st.radio(
-                "Recovery route", ["SR", "PR"],
-                index=0 if st.session_state.ev_route == "SR" else 1,
-                format_func=lambda r: ("Pull to N71 first (SR)" if r == "SR"
-                                       else "Store to store (PR)"),
-                horizontal=True, label_visibility="collapsed",
-            )
-            if route != st.session_state.ev_route:
-                st.session_state.ev_route = route
-                st.session_state.ev_results = {}
-                st.rerun()
-        else:
-            route = "SR"
-
-        actions = ev.plan_actions(event, lines, route=route)
+        actions = ev.plan_actions(event, lines)
 
         if not actions:
             st.markdown('<div class="ev-empty">Nothing to generate — every SKU is '

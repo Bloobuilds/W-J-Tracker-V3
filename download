@@ -9,6 +9,9 @@
 *.csv
 hjw_events_*.json
 
+# Local storage fallback (used when no Railway volume is mounted)
+.localdata/
+
 # Python
 __pycache__/
 *.pyc

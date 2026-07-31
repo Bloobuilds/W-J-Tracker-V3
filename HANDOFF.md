@@ -33,24 +33,61 @@ Layering, which must be preserved:
   st.secrets to os.environ, so it works on both Streamlit Cloud and Railway).
 - `.streamlit/config.toml` sets the navy theme (primaryColor #1a1a2e).
 - `requests` was removed from requirements.txt on 24 Jul 2026 — it was a leftover from the
-  deleted GitHub counter sync and is imported nowhere.
+  deleted GitHub counter sync and is imported nowhere. `pyarrow` was added 27 Jul 2026 for
+  parquet.
 
-### SECURITY — OPEN ITEM
-The Railway URL is **public**. There is no invite-only link on Railway; anyone with the
-hostname reaches the app. Currently the app is an empty shell until a file is uploaded, which
-limits exposure, but a visitor can upload their own file and then:
-- use the Gemini chat freely (your API key, your bill, no rate limit),
-- extract every address in `STORE_CONTACTS` via a crafted SR,
-- read the full store taxonomy out of the system prompt.
-Decisions still open: (a) password gate vs `st.login()` OIDC against the corporate tenant,
-(b) whether cached data may persist on a Railway volume at all. **If caching ships, auth must
-ship in the same change** — the empty-shell protection disappears the moment data persists.
+### PERSISTENCE (added 27 Jul 2026)
+Data now survives refreshes AND redeploys, via a Railway **volume**. Railway's container
+filesystem is ephemeral — anything written outside a mounted volume is wiped on every deploy.
+
+**Required Railway setup:**
+1. Create a volume, mount path `/data`.
+2. Variables: `DATA_DIR=/data`, `APP_PASSWORD=<something>`, plus the existing `GEMINI_API_KEY`.
+3. If the app can't write to the volume, set `RAILWAY_RUN_UID=0` — volumes mount as root and a
+   non-root container user won't have write access.
+
+`storage.py` is the single persistence layer for the whole workspace; apps call
+`load_json`/`save_json`/`save_dataframe` and know nothing about the backend. Swapping to SQLite
+or Postgres later means rewriting that one file. All writes are atomic (temp file + `os.replace`)
+so a crash or redeploy mid-write can't leave a truncated file.
+
+What is stored, under `DATA_DIR`:
+- `stock_current.parquet` + `stock_current_meta.json` — the parsed weekly file. 15,412 rows =
+  ~210KB parquet vs 1.28MB xlsx, and reloads in 0.05s vs 2.2s to re-parse the Excel (~42x).
+  Saved on upload, restored once per session by `restore_stock()`.
+- `events.json` — the event list, written by `event_app.persist_events()` after every mutation
+  (create, edit, delete, import, inline table edit).
+
+If `DATA_DIR` is unwritable the app falls back to `./.localdata` and shows a **warning in the
+sidebar** — that fallback does NOT survive a redeploy. Never ignore that warning in production.
+
+A guarded "Clear stored data" control sits in the sidebar footer (two-step confirm).
+
+**Only the current week's file is kept** — each upload overwrites the last. Retaining snapshots
+is the prerequisite for week-over-week diffing (see Roadmap).
+
+### SECURITY
+`auth.py` gates the app behind a shared password (`APP_PASSWORD`), checked with
+`hmac.compare_digest` at the very top of `main()` before any widget renders. If `APP_PASSWORD`
+is unset the app stays open and shows a warning — locking the planner out of their own deploy
+over a missing env var would be worse, but never run production without it.
+
+Scope: one shared credential stops crawlers and accidental discovery. It gives **no** per-person
+accounts, audit trail, or revocation. When someone else needs access, or IT asks where the data
+lives, the answer is `st.login()` OIDC against the corporate tenant — not this.
+
+Still true regardless of the gate: an authenticated user can use the Gemini chat freely (your
+key, your bill), extract every address in `STORE_CONTACTS` via a crafted SR, and read the store
+taxonomy out of the system prompt. Now that data persists server-side, a visitor who gets past
+the gate lands on populated data rather than an empty shell.
 
 ## FILES
-- `app.py` (~1,270 lines) — Stock Report UI, AI chat, message routing, table, app switcher
+- `app.py` — Stock Report UI, AI chat, message routing, table, app switcher, storage footer
 - `stores.py` (~1,040 lines) — store codes, aliases, contacts, all document generators
-- `events.py` (~530 lines) — Event Management engine (pure Python, no Streamlit)
-- `event_app.py` (~430 lines) — Event Management UI
+- `events.py` — Event Management engine (pure Python, no Streamlit)
+- `event_app.py` — Event Management UI
+- `storage.py` — durable storage for every app (JSON + parquet on a Railway volume)
+- `auth.py` — shared-password gate
 - `requirements.txt`, `Procfile`, `.streamlit/config.toml`, `.gitignore`
 
 ## DATA
@@ -241,12 +278,21 @@ Detection needs both "block" AND "as" (so "what is block location" still goes to
 - 24 Jul 2026: single-app → multi-app workspace. Event Management added. `render_sidebar` split
   into `render_upload` + `render_stock_filters`. Re-upload bug fixed (previously the second
   upload of a session was ignored until refresh; now keyed on filename+size).
+- 27 Jul 2026: persistence + auth. `storage.py` (volume-backed JSON + parquet) and `auth.py`
+  (shared password) added. Events and the weekly stock file now survive refresh and redeploy.
+  Per-SKU notes and per-row SR/PR route overrides added to the event model. Fixed: the `New`
+  event button was unusable (the sidebar picker reassigned the active event and cancelled the
+  draft); the venue dropdown offered N65/N7X/SG11/RDCs as venues and defaulted to N65, the
+  block location; `select_dtypes(include="object")` in the table search would silently match
+  nothing once pandas removes the str-under-object fallback.
 - User prefers: talk/plan first before building; concise chat replies; instant Python over AI
   wherever deterministic.
 
 ## KNOWN LIMITATIONS
-- Data is session-only (re-upload after refresh); nothing persists server-side.
-- Events are session-only; use Save events file to keep them.
+- Two browser tabs open at once = last-write-wins on the events file.
+- Only the current week's stock file is retained; each upload overwrites the last.
+- Railway won't mount one volume to two deployments at once, so redeploys now have a brief
+  window of downtime.
 - AI chat sends up to ~80 data rows to Google's Gemini API.
 - No header-based column filtering (Streamlit limitation).
 - No tests; parsers share duplicated extraction logic (refactor candidate).
@@ -255,9 +301,10 @@ Detection needs both "block" AND "as" (so "what is block location" still goes to
   Railway cron service — Streamlit only runs while a browser session is open.
 
 ## ROADMAP / NEXT
-1. **Week-over-week snapshot diffing.** Store each weekly upload; arrival at N71 = TRANSIT 1→0
-   while STOCK_ON_HAND 0→1. Turns INBOUND from "1 coming, no idea when" into "arrived Tuesday",
-   and finally gives an aging signal. Requires the volume + auth decision first.
+1. **Week-over-week snapshot diffing.** Keep each weekly upload (currently only the latest is
+   retained); arrival at N71 = TRANSIT 1→0 while STOCK_ON_HAND 0→1. Turns INBOUND from "1
+   coming, no idea when" into "arrived Tuesday", and finally gives an aging signal. The volume
+   and auth groundwork is now in place — this needs a retention policy and a snapshot namespace.
 2. Add the 14 missing store codes; resolve the NO2/N02 question.
 3. Surface LAUNCH_DATE — a launch calendar is directly useful to event planning.
 4. Cross-app AI ("which event SKUs do we actually have stock for") once each app exposes a
