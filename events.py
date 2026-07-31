@@ -27,7 +27,7 @@ from datetime import datetime, date, timedelta
 import pandas as pd
 
 from stores import (
-    STORE_CODES,
+    STORE_CODES, store_flag,
     parse_oms_request, generate_oms_csv,
     parse_sr_request, generate_sr_csv, generate_sr_email,
     parse_pr_request, generate_pr_csv, generate_pr_email,
@@ -112,19 +112,27 @@ def parse_sku_list(text, df):
 # EVENT MODEL
 # ─────────────────────────────────────────────
 
-def new_event(name, event_date, venue_type, venue_code="", block_name="", skus=None):
+def new_event(name, event_date, venue_type, venue_code="", block_name="", skus=None,
+              end_date=None):
     """Create an event dict.
 
     venue_type: 'store' -> venue_code is a store code (OMS destination)
                 'block' -> block_name is the ORDERNAME used by the Block flow
-    event_date: datetime.date or 'YYYY-MM-DD'
+    event_date: start date — datetime.date or 'YYYY-MM-DD'
+    end_date:   optional last day. The key stays "event_date" for the start so
+                events saved before end dates existed still load.
+
+    Deadlines run off the START date: stock has to be there for day one.
     """
     if isinstance(event_date, str):
         event_date = datetime.strptime(event_date, "%Y-%m-%d").date()
+    if isinstance(end_date, str) and end_date:
+        end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
     return {
         "id": f"evt_{uuid.uuid4().hex[:8]}",
         "name": (name or "").strip(),
         "event_date": event_date.isoformat(),
+        "end_date": end_date.isoformat() if end_date else "",
         "venue_type": venue_type,
         "venue_code": (venue_code or "").upper().strip(),
         "block_name": (block_name or "").strip(),
@@ -159,9 +167,42 @@ def validate_event(event):
             problems.append("Block name cannot contain a comma — it breaks the CSV.")
     else:
         problems.append("Venue must be a store or a block.")
+    end = event.get("end_date")
+    if end:
+        try:
+            if datetime.strptime(end, "%Y-%m-%d").date() < \
+               datetime.strptime(event["event_date"], "%Y-%m-%d").date():
+                problems.append("End date is before the start date.")
+        except (ValueError, KeyError):
+            problems.append("End date is not a valid date.")
     if not event.get("skus"):
         problems.append("Event has no SKUs.")
     return problems
+
+
+def date_range_label(event):
+    """Compact date label: '28 Aug', '28–30 Aug', or '28 Aug – 2 Sep'."""
+    try:
+        start = datetime.strptime(event["event_date"], "%Y-%m-%d").date()
+    except (ValueError, KeyError):
+        return event.get("event_date", "?")
+    end_raw = event.get("end_date")
+    if not end_raw or end_raw == event["event_date"]:
+        return start.strftime("%d %b")
+    try:
+        end = datetime.strptime(end_raw, "%Y-%m-%d").date()
+    except ValueError:
+        return start.strftime("%d %b")
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{start.strftime('%d')}–{end.strftime('%d %b')}"
+    return f"{start.strftime('%d %b')} – {end.strftime('%d %b')}"
+
+
+def event_flag(event):
+    """Flag of the venue's country. Blocks sit at N65, which is Singapore."""
+    if event.get("venue_type") == "store" and event.get("venue_code"):
+        return store_flag(event["venue_code"])
+    return store_flag(BLOCK_LOCATION)
 
 
 def ready_by_date(event):
@@ -342,7 +383,8 @@ def build_brief(event, lines, today=None):
     else:
         deadline_line = f"{days} day(s) until the ready-by date ({ready_by_date(event).strftime('%d %b %Y')})."
 
-    headline = f"{settled}/{total} settled for {event['name']} → {venue_label}. {deadline_line}"
+    headline = (f"{settled}/{total} settled for {event['name']} → {venue_label} "
+                f"({date_range_label(event)}). {deadline_line}")
 
     actions = []
     if counts[STATUS_BLOCKED]:
@@ -398,7 +440,7 @@ def plan_actions(event, lines):
     if ready:
         if not is_store_venue:
             actions.append({
-                "kind": "BLOCK",
+                "kind": "BLOCK", "doc": "Block",
                 "label": f"Block {len(ready)} SKU(s) → N65 as '{event['block_name']}'",
                 "command": f"block {' '.join(ready)} as {event['block_name']}",
                 "skus": ready,
@@ -407,7 +449,7 @@ def plan_actions(event, lines):
         else:
             dest = event["venue_code"]
             actions.append({
-                "kind": "OMS",
+                "kind": "OMS", "doc": "OMS",
                 "label": f"OMS {len(ready)} SKU(s) → {dest}",
                 "command": f"oms to {dest} for {' '.join(ready)}",
                 "skus": ready,
@@ -431,7 +473,7 @@ def plan_actions(event, lines):
         if route == "PR":
             dest = event["venue_code"]
             actions.append({
-                "kind": "PR",
+                "kind": "PR", "doc": "PR",
                 "label": f"PR {len(skus)} SKU(s) {src} → {dest}",
                 "command": f"pr {dest} from {src} for {' '.join(skus)}",
                 "skus": skus,
@@ -441,7 +483,7 @@ def plan_actions(event, lines):
             # One file, both legs: src → N71 (SR), then N71 → venue (OMS).
             dest = event["venue_code"]
             actions.append({
-                "kind": "SR",
+                "kind": "SR", "doc": "SR + OMS",
                 "label": f"SR + OMS {len(skus)} SKU(s) {src} → {dest}",
                 "command": f"sr from {src} for {' '.join(skus)} and send to {dest}",
                 "skus": skus,
@@ -450,7 +492,7 @@ def plan_actions(event, lines):
         else:
             # Block venue: src → N71 (SR), then N71 → N65 under the block name.
             actions.append({
-                "kind": "SR",
+                "kind": "SR", "doc": "SR + Block",
                 "label": f"SR + Block {len(skus)} SKU(s) from {src}",
                 "command": (f"sr from {src} for {' '.join(skus)} "
                             f"and block as {event['block_name']}"),
@@ -461,34 +503,34 @@ def plan_actions(event, lines):
     return actions
 
 
-def run_action(action, df):
+def run_action(action, df, event_name=None):
     """Execute one planned action through the stores.py engine.
+
+    event_name, when given, is threaded into the notification emails so the
+    store can see which event the request belongs to.
 
     Returns {ok, summary, warnings, errors, csv, filename, emails}
     """
     kind = action["kind"]
     cmd = action["command"]
+    doc = action.get("doc", kind)
 
     if kind == "OMS":
         res = parse_oms_request(cmd, df)
         csv = generate_oms_csv(res["orders"]) if res["success"] else None
         emails = []
-        prefix = "OMS"
     elif kind == "SR":
         res = parse_sr_request(cmd, df)
         csv = generate_sr_csv(res["orders"]) if res["success"] else None
-        emails = generate_sr_email(res["orders"], df) if res["success"] else []
-        prefix = "SR"
+        emails = generate_sr_email(res["orders"], df, event_name) if res["success"] else []
     elif kind == "PR":
         res = parse_pr_request(cmd, df)
         csv = generate_pr_csv(res["orders"]) if res["success"] else None
-        emails = generate_pr_email(res["orders"], df) if res["success"] else []
-        prefix = "PR"
+        emails = generate_pr_email(res["orders"], df, event_name) if res["success"] else []
     elif kind == "BLOCK":
         res = parse_block_request(cmd, df)
         csv = generate_block_csv(res["orders"]) if res["success"] else None
         emails = []
-        prefix = "BLOCK"
     else:
         return {"ok": False, "summary": "", "warnings": [],
                 "errors": [f"Unknown action type {kind}"], "csv": None,
@@ -500,7 +542,8 @@ def run_action(action, df):
         "warnings": res.get("warnings", []),
         "errors": res.get("errors", []),
         "csv": csv,
-        "filename": f"{prefix}_{datetime.now().strftime('%d%m%y')}.csv",
+        "filename": f"{doc.replace(' + ', '_').replace(' ', '')}_"
+                    f"{datetime.now().strftime('%d%m%y')}.csv",
         "emails": emails,
     }
 
@@ -532,6 +575,7 @@ def events_from_json(text):
         e.setdefault("notes", "")
         e.setdefault("notes_by_sku", {})
         e.setdefault("route_by_sku", {})
+        e.setdefault("end_date", "")
         out.append(e)
     return out
 

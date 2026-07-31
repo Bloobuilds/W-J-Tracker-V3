@@ -170,11 +170,11 @@ def render_event_sidebar(df):
         for e in sorted(evts, key=lambda x: x.get("event_date", "")):
             days, urgency = ev.event_urgency(e)
             active = e["id"] == st.session_state.ev_active_id
-            try:
-                when = datetime.strptime(e["event_date"], "%Y-%m-%d").strftime("%d %b")
-            except (ValueError, KeyError):
-                when = e.get("event_date", "?")
-            label = f"{URGENCY_DOT.get(urgency, '○')}  {e['name']} · {when}"
+            when = ev.date_range_label(e)
+            # Flag of the venue country. The urgency word is appended only
+            # when it is not ON TRACK, so the list stays quiet until it matters.
+            tail = "" if urgency == "ON TRACK" else f" · {urgency}"
+            label = f"{ev.event_flag(e)}  {e['name']} · {when}{tail}"
             if st.button(label, key=f"ev_pick_{e['id']}", use_container_width=True,
                          type="primary" if active else "secondary"):
                 if not active:
@@ -246,10 +246,23 @@ def render_event_form(df):
 
     default_date = (date.today() + timedelta(days=21) if is_new
                     else datetime.strptime(event["event_date"], "%Y-%m-%d").date())
-    event_date = st.date_input("Event date", value=default_date, key=f"{k}_date")
+    default_end = default_date
+    if not is_new and event.get("end_date"):
+        try:
+            default_end = datetime.strptime(event["end_date"], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    d1, d2 = st.columns(2)
+    with d1:
+        event_date = st.date_input("Starts", value=default_date, key=f"{k}_date")
+    with d2:
+        end_date = st.date_input("Ends", value=max(default_end, event_date),
+                                 min_value=event_date, key=f"{k}_end")
+
     st.caption(f"Everything must be ready to send by "
                f"**{(event_date - timedelta(days=ev.READY_LEAD_DAYS)).strftime('%d %b %Y')}** "
-               f"({ev.READY_LEAD_DAYS} days before).")
+               f"({ev.READY_LEAD_DAYS} days before it starts).")
 
     venue_type = st.radio(
         "Venue", ["store", "block"],
@@ -292,7 +305,7 @@ def render_event_form(df):
     with c1:
         if st.button("Save event", type="primary", use_container_width=True):
             draft = ev.new_event(name, event_date, venue_type, venue_code,
-                                 block_name, known + unknown)
+                                 block_name, known + unknown, end_date=end_date)
             problems = ev.validate_event(draft)
             if problems:
                 for p in problems:
@@ -437,11 +450,11 @@ def render_event_app(df):
 
     st.markdown(f"""
     <div class="app-header">
-        <h1>{event['name']}</h1>
+        <h1>{ev.event_flag(event)} {event['name']}</h1>
         <span class="stats">
-            {venue_label} &nbsp;|&nbsp; Event {event['event_date']} &nbsp;|&nbsp;
-            Ready by {ev.ready_by_date(event).strftime('%d %b %Y')} &nbsp;|&nbsp;
-            {brief['total']} SKUs (${brief['value']:,.0f})
+            {venue_label} &nbsp;|&nbsp; {ev.date_range_label(event)} {event['event_date'][:4]}
+            &nbsp;|&nbsp; Ready by {ev.ready_by_date(event).strftime('%d %b %Y')}
+            &nbsp;|&nbsp; {brief['total']} SKUs (${brief['value']:,.0f})
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -531,10 +544,12 @@ def render_event_app(df):
             </div>
             """, unsafe_allow_html=True)
 
+            doc = action.get("doc", action["kind"])
             key = f"{action['kind']}::{action['label']}"
-            if st.button(f"Generate {action['kind']}", key=f"ev_gen_{i}",
+            if st.button(f"Generate {doc}", key=f"ev_gen_{i}",
                          use_container_width=True):
-                st.session_state.ev_results[key] = ev.run_action(action, df)
+                st.session_state.ev_results[key] = ev.run_action(
+                    action, df, event_name=event["name"])
                 st.rerun()
 
             result = st.session_state.ev_results.get(key)
@@ -545,7 +560,7 @@ def render_event_app(df):
                         st.warning(w)
                     if result["csv"]:
                         st.download_button(
-                            f"Download {action['kind']} CSV",
+                            f"Download {doc} CSV",
                             data=result["csv"], file_name=result["filename"],
                             mime="text/csv", use_container_width=True,
                             key=f"ev_dl_{i}",

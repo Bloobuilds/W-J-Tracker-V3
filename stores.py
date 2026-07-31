@@ -6,6 +6,7 @@ Pure Python, no AI. Instant OMS generation with smart warnings.
 """
 
 import re
+import html
 import pandas as pd
 from datetime import datetime
 
@@ -133,6 +134,27 @@ STORE_ALIASES = {
     "MUMBAI": "Y11", "JIO WORLD": "Y11",
     "NEW DELHI": "Y03",
 }
+
+
+COUNTRY_FLAGS = {
+    "AUSTRALIA": "🇦🇺", "HONG KONG": "🇭🇰", "INDIA": "🇮🇳", "INDONESIA": "🇮🇩",
+    "JAPAN": "🇯🇵", "MALAYSIA": "🇲🇾", "NEW ZEALAND": "🇳🇿", "PHILIPPINES": "🇵🇭",
+    "SINGAPORE": "🇸🇬", "THAILAND": "🇹🇭", "VIETNAM": "🇻🇳", "GUAM": "🇬🇺",
+    "DOHA": "🇶🇦", "GENEVA": "🇨🇭", "CERGY": "🇫🇷", "DERET": "🇫🇷",
+    "CENTRAL": "📦",          # internal/central, not a country
+}
+DEFAULT_FLAG = "🏳️"
+
+
+def country_flag(country):
+    """Flag for a STORE_CODES country value. Unknown values get a neutral flag."""
+    return COUNTRY_FLAGS.get(str(country or "").upper(), DEFAULT_FLAG)
+
+
+def store_flag(code):
+    """Flag for a store code."""
+    info = STORE_CODES.get(str(code or "").upper())
+    return country_flag(info["country"]) if info else DEFAULT_FLAG
 
 
 def resolve_store(text):
@@ -748,7 +770,7 @@ STORE_CONTACTS = {
 }
 
 
-def generate_sr_email(orders, df):
+def generate_sr_email(orders, df, event_name=None):
     """Generate email template for SR notification.
 
     Returns dict per source store with: to, cc, subject, body (HTML table).
@@ -809,6 +831,10 @@ def generate_sr_email(orders, df):
 
         # Subject
         subject = f"{universe_str} SR ({store_code})"
+        if event_name:
+            subject += f" — {event_name}"
+        event_clause = (f" for <b>{html.escape(str(event_name))}</b>"
+                        if event_name else "")
 
         # Due date = expiration (YYYYMMDD → readable)
         exp = store_orders[0]["EXPIRATION_DATE"]
@@ -835,7 +861,7 @@ def generate_sr_email(orders, df):
 
         body_html = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#333;">
 Dear Team,<br><br>
-The following SR has been uploaded. Please complete it by <b style="color:red;">{due_str}</b>.<br><br><br>
+The following SR has been uploaded{event_clause}. Please complete it by <b style="color:red;">{due_str}</b>.<br><br><br>
 <table style="border-collapse:collapse;">
 <tr>
 <th style="border:1px solid #8db4e2;padding:4px 8px;background:#4472C4;color:white;font-size:11pt;">SKU</th>
@@ -847,7 +873,7 @@ The following SR has been uploaded. Please complete it by <b style="color:red;">
 </tr>
 {table_rows_html}
 </table>
-<br>Thank you!
+<br>Thank you for your support!
 </div>"""
 
         emails.append({
@@ -1022,7 +1048,7 @@ def generate_pr_csv(orders):
     return "\n".join(lines)
 
 
-def generate_pr_email(orders, df):
+def generate_pr_email(orders, df, event_name=None):
     """Generate email template for PR notification.
 
     Goes to the source store (SHIP_FROM). Shows FROM source TO destination.
@@ -1070,6 +1096,10 @@ def generate_pr_email(orders, df):
         # Destination (SHIP_TO) — same for all lines in a PR
         dest_code = store_orders[0]["SHIP_TO"]
         subject = f"{universe_str} Store Transfer ({store_code} → {dest_code})"
+        if event_name:
+            subject += f" — {event_name}"
+        event_clause = (f" for <b>{html.escape(str(event_name))}</b>"
+                        if event_name else "")
 
         # Due date = expiration
         exp = store_orders[0]["EXPIRATION_DATE"]
@@ -1096,7 +1126,7 @@ def generate_pr_email(orders, df):
 
         body_html = f"""<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#333;">
 Dear Team,<br><br>
-The following store transfer has been requested. Please complete it by <b style="color:red;">{due_str}</b>.<br><br><br>
+The following store transfer has been requested{event_clause}. Please complete it by <b style="color:red;">{due_str}</b>.<br><br><br>
 <table style="border-collapse:collapse;">
 <tr>
 <th style="border:1px solid #8db4e2;padding:4px 8px;background:#4472C4;color:white;font-size:11pt;">SKU</th>
@@ -1108,7 +1138,7 @@ The following store transfer has been requested. Please complete it by <b style=
 </tr>
 {table_rows_html}
 </table>
-<br>Thank you!
+<br>Thank you for your support!
 </div>"""
 
         emails.append({

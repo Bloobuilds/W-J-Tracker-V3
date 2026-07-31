@@ -177,7 +177,11 @@ SKUs, excluding store codes. Quantity: "qty N" or "N units/pcs" (default 1).
 ## APP 2 — EVENT MANAGEMENT
 
 ### Concept
-An event = name + date + venue + pasted SKU list. Venue is either a **store code** (goods move
+An event = name + start date (+ optional end date) + venue + pasted SKU list.
+The start date is stored under the key **`event_date`** (not renamed, so events saved before
+end dates existed still load); the optional end is `end_date`, "" when unset. All deadlines run
+off the START date — stock has to be there for day one. `date_range_label()` renders
+"28 Aug", "28–30 Aug", or "28 Aug – 2 Sep". Venue is either a **store code** (goods move
 N71 → store, an OMS) or a **block** (goods move N71 → N65 under a custom ORDERNAME).
 Deadline rule: everything must be ready to send `READY_LEAD_DAYS` (=7) before the event date.
 
@@ -196,9 +200,12 @@ Deadline rule: everything must be ready to send `READY_LEAD_DAYS` (=7) before th
 "Free" = STOCK_ON_HAND − PICKING − RESERVATION, floored at 0.
 
 ### Sidebar
-Events are an always-visible list (not a dropdown), sorted by event date ascending, so an
-overdue event sorts to the top. Coloured dot = urgency. Active event is the primary-styled
-button. On load the soonest event opens, not the first created.
+Events are an always-visible list (not a dropdown), sorted by start date ascending, so an
+overdue event sorts to the top. Each row shows the **venue country's flag**
+(`COUNTRY_FLAGS` in stores.py, keyed to the country values already in STORE_CODES; blocks show
+🇸🇬 since N65 is Singapore), the name and the date range. The urgency word is appended only
+when it is NOT "ON TRACK", so the list stays quiet until something needs attention. Active
+event is the primary-styled button. On load the soonest event opens, not the first created.
 
 ### Action planning
 `plan_actions()` groups the analysis into runnable commands, `run_action()` executes them
@@ -209,6 +216,10 @@ through stores.py:
   store venue → `sr from {src} for {skus} and send to {venue}`
   block venue → `sr from {src} for {skus} and block as {block_name}`
 - ELSEWHERE, route PR → `pr {venue} from {src} for {skus}` (direct store-to-store)
+Every action carries a **`doc`** field naming the document it produces ("OMS", "PR", "Block",
+"SR + OMS", "SR + Block"). That drives the button ("Generate SR + OMS"), the download label and
+the filename (`SR_OMS_310726.csv`) — so a two-leg action never claims to be just an SR.
+
 The Route column offers SR/PR for store venues only. For a block venue it stays hidden and
 everything routes via N71, because a block is by definition an N71→N65 movement — there is no
 "direct to block" process. Revisit if that turns out to be wrong.
@@ -317,6 +328,10 @@ Detection needs both "block" AND "as" (so "what is block location" still goes to
   20-column row against a 19-column header — silently malformed CSV, in BOTH the new combined
   command and the pre-existing standalone `block` command; now rejected with a clear error.
   Added warnings for an unresolved onward destination and for source == destination.
+- 31 Jul 2026 (later): events gained an optional end date; sidebar dots replaced by venue
+  country flags with the urgency word shown only when not ON TRACK; action buttons and
+  filenames now name the actual document ("Generate SR + OMS"); event name threaded into SR/PR
+  notification emails; email sign-off changed to "Thank you for your support!".
 - User prefers: talk/plan first before building; concise chat replies; instant Python over AI
   wherever deterministic.
 
